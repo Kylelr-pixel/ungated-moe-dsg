@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from my_code import ScaledUnGatedFunction, DomainSignatureGenerator, SwiGLUExpert
 
-# --- 8-DOMAIN INDUSTRY STANDARD SCALE-UP CONFIG (WITH DUAL SMOOTH WAVES) ---
+# --- SIDE-BY-SIDE INDUSTRY STANDARD COMPARISON CONFIG ---
 BATCH_SIZE = 16
 SEQ_LEN = 64
 HIDDEN_DIM = 256
@@ -13,25 +13,10 @@ NUM_EXPERTS = 16
 TOP_K = 2
 STEPS_PER_DOMAIN = 60
 
-print("="*85)
-print(f"  8-DOMAIN BENCHMARK: {NUM_EXPERTS} Experts, Top-{TOP_K} Sparse (Dual Low-Amplitude Smooth Domains)")
-print("="*85)
-
-dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
-expert_proj = nn.Linear(SIGNATURE_DIM, NUM_EXPERTS)
-experts = nn.ModuleList([SwiGLUExpert(HIDDEN_DIM, INTERMEDIATE_DIM) for _ in range(NUM_EXPERTS)])
-
-dense_baseline = nn.Sequential(
-    nn.Linear(HIDDEN_DIM, INTERMEDIATE_DIM, bias=False),
-    nn.SiLU(),
-    nn.Linear(INTERMEDIATE_DIM, HIDDEN_DIM, bias=False)
-)
-
-optimizer = torch.optim.AdamW(
-    list(dsg.parameters()) + list(expert_proj.parameters()) + list(experts.parameters()), 
-    lr=1e-3
-)
-opt_dense = torch.optim.AdamW(dense_baseline.parameters(), lr=1e-3)
+print("="*95)
+print(f"  SIDE-BY-SIDE BENCHMARK: Standard Sparse MoE vs. ScaledUnGated Calibration MoE")
+print(f"  ({NUM_EXPERTS} Experts, Top-{TOP_K} Sparse, 8 Unconstrained Domains)")
+print("="*95)
 
 torch.manual_seed(101)
 domains = {
@@ -48,80 +33,70 @@ domains = {
 total_tokens_per_step = BATCH_SIZE * SEQ_LEN * TOP_K
 
 for domain_name, data_tensor in domains.items():
-    head_token_counts = torch.zeros(NUM_EXPERTS)
-    head_active_grads = torch.zeros(NUM_EXPERTS)
-    head_inactive_grads = torch.zeros(NUM_EXPERTS)
-    
-    print(f"\n" + "="*85)
-    print(f"PROCESSING: {domain_name}")
-    print("="*85)
-    
-    for step in range(1, STEPS_PER_DOMAIN + 1):
-        opt_dense.zero_grad()
-        out_dense = dense_baseline(data_tensor)
-        loss_dense = F.mse_loss(out_dense, data_tensor)
-        loss_dense.backward()
-        opt_dense.step()
-        
-        optimizer.zero_grad()
-        sig_weights = dsg(data_tensor)
-        gate_logits = expert_proj(sig_weights)
-        gate_probs = F.softmax(gate_logits, dim=-1)
-        
-        topk_probs, topk_indices = torch.topk(gate_probs, k=TOP_K, dim=-1)
-        active_mask = torch.zeros_like(gate_probs)
-        active_mask.scatter_(-1, topk_indices, 1.0)
-                
-        with torch.no_grad():
-            head_token_counts += active_mask.sum(dim=(0, 1))
-            
-        expert_outputs = torch.stack([expert(data_tensor) for expert in experts], dim=2)
-        
-        out_moe_raw = ScaledUnGatedFunction.apply(
-            expert_outputs, gate_probs.unsqueeze(-1), active_mask.unsqueeze(-1), 1.0
-        )
-        out_moe = out_moe_raw.sum(dim=2)
-        
-        primary_loss = F.mse_loss(out_moe, data_tensor)
-        z_loss = torch.mean(torch.logsumexp(gate_logits, dim=-1)**2)
-        
-        tokens_per_exp = active_mask.sum(dim=(0, 1)) / total_tokens_per_step
-        router_prob_per_exp = gate_probs.mean(dim=(0, 1))
-        aux_loss = NUM_EXPERTS * torch.sum(tokens_per_exp * router_prob_per_exp)
-        
-        total_loss = primary_loss + (0.001 * z_loss) + (0.15 * aux_loss)
-        total_loss.backward()
-        
-        step_token_counts = active_mask.sum(dim=(0, 1))
-        with torch.no_grad():
-            for i, expert in enumerate(experts):
-                if expert.w1.weight.grad is not None:
-                    g_norm = expert.w1.weight.grad.norm().item()
-                    if step_token_counts[i].item() > 0:
-                        head_active_grads[i] += g_norm
-                    else:
-                        head_inactive_grads[i] += g_norm
-                        
-        optimizer.step()
-        
-    mean_u = head_token_counts.mean().item()
-    std_u = head_token_counts.std().item()
-    cv = (std_u / mean_u) * 100 if mean_u > 0 else 0
-    
-    print(f"  - Dense Baseline MSE Loss : {loss_dense.item():.6f}")
-    print(f"  - ScaledUnGated MoE MSE   : {primary_loss.item():.6f}")
-    print(f"  - MSE Loss Reduction     : {((loss_dense.item() - primary_loss.item()) / loss_dense.item()) * 100:+.2f}%")
-    print(f"  - Router Load Balance CV : {cv:.2f}%")
-    print("-" * 75)
-    print(f"  {'Head ID':<8} | {'Tokens Routed':<16} | {'Avg Active Grad':<18} | {'Avg Inactive Grad':<18}")
-    print("  " + "-" * 75)
-    
-    total_domain_tokens = head_token_counts.sum().item()
-    for i in range(NUM_EXPERTS):
-        cnt = int(head_token_counts[i].item())
-        pct = (cnt / total_domain_tokens) * 100 if total_domain_tokens > 0 else 0
-        act_g = head_active_grads[i].item() / STEPS_PER_DOMAIN
-        inact_g = head_inactive_grads[i].item() / STEPS_PER_DOMAIN
-        print(f"  Head {i:<2}   | {cnt:<6} ({pct:5.1f}%) | {act_g:<18.6f} | {inact_g:<18.6f}")
+    # --- MODEL A: Standard MoE (No Calibration - unselected experts get 0 grad) ---
+    torch.manual_seed(42)
+    dsg_std = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
+    proj_std = nn.Linear(SIGNATURE_DIM, NUM_EXPERTS)
+    experts_std = nn.ModuleList([SwiGLUExpert(HIDDEN_DIM, INTERMEDIATE_DIM) for _ in range(NUM_EXPERTS)])
+    opt_std = torch.optim.AdamW(list(dsg_std.parameters()) + list(proj_std.parameters()) + list(experts_std.parameters()), lr=1e-3)
 
-print("="*85)
+    # --- MODEL B: Your Calibrated MoE (ScaledUnGatedFunction) ---
+    torch.manual_seed(42)
+    dsg_cal = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
+    proj_cal = nn.Linear(SIGNATURE_DIM, NUM_EXPERTS)
+    experts_cal = nn.ModuleList([SwiGLUExpert(HIDDEN_DIM, INTERMEDIATE_DIM) for _ in range(NUM_EXPERTS)])
+    opt_cal = torch.optim.AdamW(list(dsg_cal.parameters()) + list(proj_cal.parameters()) + list(experts_cal.parameters()), lr=1e-3)
+
+    std_tokens = torch.zeros(NUM_EXPERTS)
+    cal_tokens = torch.zeros(NUM_EXPERTS)
+
+    for step in range(1, STEPS_PER_DOMAIN + 1):
+        # --- Train Standard Model ---
+        opt_std.zero_grad()
+        logits_std = proj_std(dsg_std(data_tensor))
+        probs_std = F.softmax(logits_std, dim=-1)
+        topk_p_std, topk_i_std = torch.topk(probs_std, k=TOP_K, dim=-1)
+        mask_std = torch.zeros_like(probs_std).scatter_(-1, topk_i_std, 1.0)
+        
+        with torch.no_grad():
+            std_tokens += mask_std.sum(dim=(0, 1))
+
+        expert_outs_std = torch.stack([exp(data_tensor) for exp in experts_std], dim=2)
+        out_std = (expert_outs_std * mask_std.unsqueeze(-1)).sum(dim=2)
+        loss_std = F.mse_loss(out_std, data_tensor) + 0.001 * torch.mean(torch.logsumexp(logits_std, dim=-1)**2)
+        loss_std.backward()
+        opt_std.step()
+
+        # --- Train Calibrated Model ---
+        opt_cal.zero_grad()
+        logits_cal = proj_cal(dsg_cal(data_tensor))
+        probs_cal = F.softmax(logits_cal, dim=-1)
+        topk_p_cal, topk_i_cal = torch.topk(probs_cal, k=TOP_K, dim=-1)
+        mask_cal = torch.zeros_like(probs_cal).scatter_(-1, topk_i_cal, 1.0)
+        
+        with torch.no_grad():
+            cal_tokens += mask_cal.sum(dim=(0, 1))
+
+        expert_outs_cal = torch.stack([exp(data_tensor) for exp in experts_cal], dim=2)
+        out_cal_raw = ScaledUnGatedFunction.apply(
+            expert_outs_cal, probs_cal.unsqueeze(-1), mask_cal.unsqueeze(-1), 1.0
+        )
+        out_cal = out_cal_raw.sum(dim=2)
+        
+        tokens_per_exp_c = mask_cal.sum(dim=(0, 1)) / total_tokens_per_step
+        aux_loss_c = NUM_EXPERTS * torch.sum(tokens_per_exp_c * probs_cal.mean(dim=(0, 1)))
+        loss_cal = F.mse_loss(out_cal, data_tensor) + (0.001 * torch.mean(torch.logsumexp(logits_cal, dim=-1)**2)) + (0.15 * aux_loss_c)
+        loss_cal.backward()
+        opt_cal.step()
+
+    std_dead_heads = (std_tokens == 0).sum().item()
+    cal_dead_heads = (cal_tokens == 0).sum().item()
+
+    print(f"\n" + "="*85)
+    print(f"RESULTS FOR: {domain_name}")
+    print("="*85)
+    print(f"  Standard MoE Final MSE Loss      : {loss_std.item():.6f} | Dead Experts: {std_dead_heads}/{NUM_EXPERTS}")
+    print(f"  Calibrated MoE Final MSE Loss    : {loss_cal.item():.6f} | Dead Experts: {cal_dead_heads}/{NUM_EXPERTS}")
+    print("-" * 85)
+
+print("="*95)
