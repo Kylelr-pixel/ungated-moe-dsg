@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import time
 from my_code import ScaledUnGatedFunction, DomainSignatureGenerator
 
-# --- FIXED PRODUCTION CONFIG (NO TUNING ALLOWED) ---
+# --- FIXED PRODUCTION CONFIG ---
 BATCH_SIZE = 32
 SEQ_LEN = 128
 HIDDEN_DIM = 256
@@ -18,7 +18,6 @@ print("="*70)
 print("  BLIND HOLDOUT & REAL-WORLD DOMAIN GENERALIZATION BENCHMARK")
 print("="*70)
 
-# Instantiate Architecture
 dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
 expert_proj = nn.Linear(SIGNATURE_DIM, NUM_EXPERTS)
 expert_weights = torch.randn(NUM_EXPERTS, HIDDEN_DIM, requires_grad=True)
@@ -30,7 +29,6 @@ optimizer = torch.optim.AdamW(
 )
 opt_dense = torch.optim.AdamW(dense_baseline.parameters(), lr=1e-3)
 
-# DEFINE 4 DISTINCT UNSEEN DATA DOMAINS
 torch.manual_seed(101)
 domains = {
     "Domain A (High-Variance Clusters)": torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 4.0,
@@ -81,9 +79,14 @@ for domain_name, data_tensor in domains.items():
             expert_usage += active_mask.sum(dim=(0, 1))
             
         expert_outputs = data_tensor.unsqueeze(2) * expert_weights
-        out_moe = ScaledUnGatedFunction.apply(
+        
+        # Kernel Execution
+        out_moe_raw = ScaledUnGatedFunction.apply(
             expert_outputs, gate_probs.unsqueeze(-1), active_mask.unsqueeze(-1), 0.1
         )
+        
+        # Sum across experts dimension [32, 128, 8, 256] -> [32, 128, 256]
+        out_moe = out_moe_raw.sum(dim=2)
         
         primary_loss = F.mse_loss(out_moe, data_tensor)
         tokens_per_exp = active_mask.sum(dim=(0, 1)) / total_tokens
@@ -94,7 +97,6 @@ for domain_name, data_tensor in domains.items():
         total_loss.backward()
         optimizer.step()
         
-    # Calculate Load Balance CV for this Domain
     mean_u = expert_usage.mean().item()
     std_u = expert_usage.std().item()
     cv = (std_u / mean_u) * 100 if mean_u > 0 else 0
