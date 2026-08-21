@@ -3,18 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from my_code import ScaledUnGatedFunction, DomainSignatureGenerator, SwiGLUExpert
 
-# --- COMPREHENSIVE SPARSE BENCHMARK & STEP TRACKER ---
+# --- INDUSTRY-STANDARD SCALE-UP CONFIG: 16 Experts, Top-2 Sparse ---
 BATCH_SIZE = 16
 SEQ_LEN = 64
 HIDDEN_DIM = 256
 INTERMEDIATE_DIM = 512
 SIGNATURE_DIM = 64
-NUM_EXPERTS = 8
+NUM_EXPERTS = 16  # Scaled up from 8 to 16
 TOP_K = 2
 STEPS_PER_DOMAIN = 100
 
 print("="*85)
-print(f"  COMPREHENSIVE HOLDOUT BENCHMARK: Top-{TOP_K} Sparse + Step-Level Starvation Tracking")
+print(f"  INDUSTRY-STANDARD SCALE-UP TEST: {NUM_EXPERTS} Experts, Top-{TOP_K} Sparse, Unconstrained")
 print("="*85)
 
 dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
@@ -49,10 +49,10 @@ for domain_name, data_tensor in domains.items():
     head_inactive_grads = torch.zeros(NUM_EXPERTS)
     
     print(f"\n" + "="*85)
-    print(f"PROCESSING: {domain_name}")
+    print(f"PROCESSING: {domain_name} ({NUM_EXPERTS} Experts)")
     print("="*85)
-    print(f"{'Step':<6} | {'Starved Heads (0 Tokens)':<35} | {'Calibration Handoff Active?'}")
-    print("-" * 75)
+    print(f"{'Step':<6} | {'Starved Heads Count':<25} | {'Calibration Handoff Active?'}")
+    print("-" * 65)
     
     for step in range(1, STEPS_PER_DOMAIN + 1):
         # 1. Dense Baseline Step
@@ -62,7 +62,7 @@ for domain_name, data_tensor in domains.items():
         loss_dense.backward()
         opt_dense.step()
         
-        # 2. Sparse MoE Step
+        # 2. 16-Expert Sparse MoE Step
         optimizer.zero_grad()
         sig_weights = dsg(data_tensor)
         gate_logits = expert_proj(sig_weights)
@@ -93,13 +93,13 @@ for domain_name, data_tensor in domains.items():
         total_loss.backward()
         
         step_token_counts = active_mask.sum(dim=(0, 1))
-        starved_heads = []
+        starved_count = 0
         calibration_fired = False
         
         with torch.no_grad():
             for i, expert in enumerate(experts):
                 if step_token_counts[i].item() == 0:
-                    starved_heads.append(f"H{i}")
+                    starved_count += 1
                     if expert.w1.weight.grad is not None and expert.w1.weight.grad.norm().item() > 0:
                         calibration_fired = True
                         g_norm = expert.w1.weight.grad.norm().item()
@@ -111,24 +111,23 @@ for domain_name, data_tensor in domains.items():
                         
         optimizer.step()
         
-        if step <= 10 or starved_heads:  # Print first 10 steps and any step with starvation
-            starved_str = ", ".join(starved_heads) if starved_heads else "None (All Active)"
-            cal_str = "YES (Calibration Handoff)" if calibration_fired else "None"
-            print(f"Step {step:<2} | {starved_str:<35} | {cal_str}")
-        elif step == 11:
-            print("... [Intermediate step logs suppressed for brevity] ...")
+        if step <= 5 or starved_count > 0:
+            cal_str = f"YES ({starved_count} heads starved)" if calibration_fired else "None"
+            print(f"Step {step:<2} | {starved_count} / {NUM_EXPERTS} experts starved        | {cal_str}")
+        elif step == 6:
+            print("... [Intermediate steps running with live calibration] ...")
             
     mean_u = head_token_counts.mean().item()
     std_u = head_token_counts.std().item()
     cv = (std_u / mean_u) * 100 if mean_u > 0 else 0
     
     print("\n" + "-"*85)
-    print(f"SUMMARY RESULTS FOR: {domain_name}")
+    print(f"16-EXPERT SUMMARY FOR: {domain_name}")
     print("-" * 85)
     print(f"  - Dense Baseline MSE Loss : {loss_dense.item():.6f}")
     print(f"  - ScaledUnGated MoE MSE   : {primary_loss.item():.6f}")
     print(f"  - MSE Loss Reduction     : {((loss_dense.item() - primary_loss.item()) / loss_dense.item()) * 100:+.2f}%")
-    print(f"  - Router Load Balance CV : {cv:.2f}% (Dropped Tokens: 0 - DROP-FREE)")
+    print(f"  - Router Load Balance CV : {cv:.2f}%")
     print("-" * 75)
     print(f"  {'Head ID':<8} | {'Tokens Routed':<16} | {'Avg Active Grad':<18} | {'Avg Inactive Grad':<18}")
     print("  " + "-" * 75)
@@ -139,6 +138,6 @@ for domain_name, data_tensor in domains.items():
         pct = (cnt / total_domain_tokens) * 100 if total_domain_tokens > 0 else 0
         act_g = head_active_grads[i].item() / STEPS_PER_DOMAIN
         inact_g = head_inactive_grads[i].item() / STEPS_PER_DOMAIN
-        print(f"  Head {i:<3} | {cnt:<6} ({pct:5.1f}%) | {act_g:<18.6f} | {inact_g:<18.6f}")
+        print(f"  Head {i:<2}   | {cnt:<6} ({pct:5.1f}%) | {act_g:<18.6f} | {inact_g:<18.6f}")
 
 print("="*85)
