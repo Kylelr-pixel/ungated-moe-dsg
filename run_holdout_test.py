@@ -1,30 +1,35 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import time
-from my_code import ScaledUnGatedFunction, DomainSignatureGenerator
+from my_code import ScaledUnGatedFunction, DomainSignatureGenerator, SwiGLUExpert
 
-# --- FIXED PRODUCTION CONFIG ---
+# --- UN-HANDICAPPED PRODUCTION CONFIG ---
 BATCH_SIZE = 32
 SEQ_LEN = 128
 HIDDEN_DIM = 256
+INTERMEDIATE_DIM = 512
 SIGNATURE_DIM = 64
 NUM_EXPERTS = 8
 TOP_K = 2
 CAPACITY_FACTOR = 1.2
 STEPS_PER_DOMAIN = 150
 
-print("="*70)
-print("  BLIND HOLDOUT & REAL-WORLD DOMAIN GENERALIZATION BENCHMARK")
-print("="*70)
+print("="*80)
+print("  BLIND HOLDOUT BENCHMARK: SwiGLU Experts + Full Per-Head Inspection")
+print("="*80)
 
 dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
 expert_proj = nn.Linear(SIGNATURE_DIM, NUM_EXPERTS)
-expert_weights = torch.randn(NUM_EXPERTS, HIDDEN_DIM, requires_grad=True)
-dense_baseline = nn.Linear(HIDDEN_DIM, HIDDEN_DIM)
+experts = nn.ModuleList([SwiGLUExpert(HIDDEN_DIM, INTERMEDIATE_DIM) for _ in range(NUM_EXPERTS)])
+
+dense_baseline = nn.Sequential(
+    nn.Linear(HIDDEN_DIM, INTERMEDIATE_DIM, bias=False),
+    nn.SiLU(),
+    nn.Linear(INTERMEDIATE_DIM, HIDDEN_DIM, bias=False)
+)
 
 optimizer = torch.optim.AdamW(
-    list(dsg.parameters()) + list(expert_proj.parameters()) + [expert_weights], 
+    list(dsg.parameters()) + list(expert_proj.parameters()) + list(experts.parameters()), 
     lr=1e-3
 )
 opt_dense = torch.optim.AdamW(dense_baseline.parameters(), lr=1e-3)
@@ -37,23 +42,25 @@ domains = {
     "Domain D (Out-of-Bounds Bimodal)": torch.bernoulli(torch.full((BATCH_SIZE, SEQ_LEN, HIDDEN_DIM), 0.5)) * 5.0 - 2.5
 }
 
-total_tokens = BATCH_SIZE * SEQ_LEN * TOP_K
-fair_share = total_tokens / NUM_EXPERTS
+total_tokens_per_step = BATCH_SIZE * SEQ_LEN * TOP_K
+fair_share = total_tokens_per_step / NUM_EXPERTS
 expert_capacity = int(fair_share * CAPACITY_FACTOR)
 
 for domain_name, data_tensor in domains.items():
-    expert_usage = torch.zeros(NUM_EXPERTS)
+    head_token_counts = torch.zeros(NUM_EXPERTS)
+    head_active_grads = torch.zeros(NUM_EXPERTS)
+    head_inactive_grads = torch.zeros(NUM_EXPERTS)
     dropped_tokens = 0
     
     for step in range(1, STEPS_PER_DOMAIN + 1):
-        # 1. Train Dense Baseline
+        # 1. Dense Baseline Step
         opt_dense.zero_grad()
         out_dense = dense_baseline(data_tensor)
         loss_dense = F.mse_loss(out_dense, data_tensor)
         loss_dense.backward()
         opt_dense.step()
         
-        # 2. Train ScaledUnGated MoE
+        # 2. ScaledUnGated SwiGLU MoE Step
         optimizer.zero_grad()
         sig_weights = dsg(data_tensor)
         gate_logits = expert_proj(sig_weights)
@@ -63,7 +70,6 @@ for domain_name, data_tensor in domains.items():
         raw_mask = torch.zeros_like(gate_probs)
         raw_mask.scatter_(-1, topk_indices, 1.0)
         
-        # Capacity Capping
         active_mask = torch.zeros_like(raw_mask)
         for exp_idx in range(NUM_EXPERTS):
             exp_mask = raw_mask[:, :, exp_idx]
@@ -76,35 +82,57 @@ for domain_name, data_tensor in domains.items():
                 active_mask[:, :, exp_idx] = exp_mask
                 
         with torch.no_grad():
-            expert_usage += active_mask.sum(dim=(0, 1))
+            head_token_counts += active_mask.sum(dim=(0, 1))
             
-        expert_outputs = data_tensor.unsqueeze(2) * expert_weights
+        expert_outputs = torch.stack([expert(data_tensor) for expert in experts], dim=2)
         
-        # Kernel Execution
         out_moe_raw = ScaledUnGatedFunction.apply(
-            expert_outputs, gate_probs.unsqueeze(-1), active_mask.unsqueeze(-1), 0.1
+            expert_outputs, gate_probs.unsqueeze(-1), active_mask.unsqueeze(-1), 1.0
         )
-        
-        # Sum across experts dimension [32, 128, 8, 256] -> [32, 128, 256]
         out_moe = out_moe_raw.sum(dim=2)
         
         primary_loss = F.mse_loss(out_moe, data_tensor)
-        tokens_per_exp = active_mask.sum(dim=(0, 1)) / total_tokens
+        tokens_per_exp = active_mask.sum(dim=(0, 1)) / total_tokens_per_step
         router_prob_per_exp = gate_probs.mean(dim=(0, 1))
         aux_loss = NUM_EXPERTS * torch.sum(tokens_per_exp * router_prob_per_exp)
         
         total_loss = primary_loss + 0.15 * aux_loss
         total_loss.backward()
+        
+        # Track gradient magnitudes per expert
+        with torch.no_grad():
+            for i, expert in enumerate(experts):
+                if expert.w1.weight.grad is not None:
+                    g_norm = expert.w1.weight.grad.norm().item()
+                    if active_mask[:, :, i].sum() > 0:
+                        head_active_grads[i] += g_norm
+                    else:
+                        head_inactive_grads[i] += g_norm
+                        
         optimizer.step()
         
-    mean_u = expert_usage.mean().item()
-    std_u = expert_usage.std().item()
+    mean_u = head_token_counts.mean().item()
+    std_u = head_token_counts.std().item()
     cv = (std_u / mean_u) * 100 if mean_u > 0 else 0
     
-    print(f"\nRESULTS FOR: {domain_name}")
+    print("\n" + "="*80)
+    print(f"RESULTS FOR: {domain_name}")
+    print("="*80)
     print(f"  - Dense Baseline MSE Loss : {loss_dense.item():.6f}")
     print(f"  - ScaledUnGated MoE MSE   : {primary_loss.item():.6f}")
     print(f"  - MSE Loss Reduction     : {((loss_dense.item() - primary_loss.item()) / loss_dense.item()) * 100:+.2f}%")
     print(f"  - Router Load Balance CV : {cv:.2f}% (Dropped Tokens: {dropped_tokens})")
+    print("-" * 80)
+    print(f"  PER-HEAD ACTIVITY & GRADIENT DISTRIBUTION OVER {STEPS_PER_DOMAIN} STEPS:")
+    print(f"  {'Head ID':<8} | {'Tokens Routed':<16} | {'Avg Active Grad':<18} | {'Avg Inactive Grad':<18}")
+    print("  " + "-" * 75)
+    
+    total_domain_tokens = head_token_counts.sum().item()
+    for i in range(NUM_EXPERTS):
+        cnt = int(head_token_counts[i].item())
+        pct = (cnt / total_domain_tokens) * 100 if total_domain_tokens > 0 else 0
+        act_g = head_active_grads[i].item() / STEPS_PER_DOMAIN
+        inact_g = head_inactive_grads[i].item() / STEPS_PER_DOMAIN
+        print(f"  Head {i:<3} | {cnt:<6} ({pct:5.1f}%) | {act_g:<18.6f} | {inact_g:<18.6f}")
 
-print("="*70)
+print("="*80)
