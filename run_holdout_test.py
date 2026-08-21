@@ -3,18 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from my_code import ScaledUnGatedFunction, DomainSignatureGenerator, SwiGLUExpert
 
-# --- INDUSTRY-STANDARD SCALE-UP CONFIG: 16 Experts, Top-2 Sparse ---
+# --- 8-DOMAIN INDUSTRY STANDARD SCALE-UP CONFIG (WITH DUAL SMOOTH WAVES) ---
 BATCH_SIZE = 16
 SEQ_LEN = 64
 HIDDEN_DIM = 256
 INTERMEDIATE_DIM = 512
 SIGNATURE_DIM = 64
-NUM_EXPERTS = 16  # Scaled up from 8 to 16
+NUM_EXPERTS = 16
 TOP_K = 2
-STEPS_PER_DOMAIN = 100
+STEPS_PER_DOMAIN = 60
 
 print("="*85)
-print(f"  INDUSTRY-STANDARD SCALE-UP TEST: {NUM_EXPERTS} Experts, Top-{TOP_K} Sparse, Unconstrained")
+print(f"  8-DOMAIN BENCHMARK: {NUM_EXPERTS} Experts, Top-{TOP_K} Sparse (Dual Low-Amplitude Smooth Domains)")
 print("="*85)
 
 dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
@@ -37,8 +37,12 @@ torch.manual_seed(101)
 domains = {
     "Domain A (High-Variance Clusters)": torch.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 4.0,
     "Domain B (Sparse Spike Signal)": (torch.rand(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) > 0.85).float() * 8.0,
-    "Domain C (Low-Amplitude Smooth)": torch.sin(torch.linspace(0, 50, BATCH_SIZE * SEQ_LEN * HIDDEN_DIM)).view(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 0.5,
-    "Domain D (Out-of-Bounds Bimodal)": torch.bernoulli(torch.full((BATCH_SIZE, SEQ_LEN, HIDDEN_DIM), 0.5)) * 5.0 - 2.5
+    "Domain C (Low-Amplitude Smooth Sine)": torch.sin(torch.linspace(0, 50, BATCH_SIZE * SEQ_LEN * HIDDEN_DIM)).view(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 0.5,
+    "Domain D (Out-of-Bounds Bimodal)": torch.bernoulli(torch.full((BATCH_SIZE, SEQ_LEN, HIDDEN_DIM), 0.5)) * 5.0 - 2.5,
+    "Domain E (High-Freq Sine Oscillation)": torch.sin(torch.linspace(0, 200, BATCH_SIZE * SEQ_LEN * HIDDEN_DIM)).view(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 2.0,
+    "Domain F (Low-Amplitude Smooth Cosine)": torch.cos(torch.linspace(0, 50, BATCH_SIZE * SEQ_LEN * HIDDEN_DIM)).view(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 0.5,
+    "Domain G (Uniform Random Noise)": torch.rand(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 6.0 - 3.0,
+    "Domain H (Intermittent Step Function)": torch.sign(torch.sin(torch.linspace(0, 50, BATCH_SIZE * SEQ_LEN * HIDDEN_DIM))).view(BATCH_SIZE, SEQ_LEN, HIDDEN_DIM) * 3.0
 }
 
 total_tokens_per_step = BATCH_SIZE * SEQ_LEN * TOP_K
@@ -49,20 +53,16 @@ for domain_name, data_tensor in domains.items():
     head_inactive_grads = torch.zeros(NUM_EXPERTS)
     
     print(f"\n" + "="*85)
-    print(f"PROCESSING: {domain_name} ({NUM_EXPERTS} Experts)")
+    print(f"PROCESSING: {domain_name}")
     print("="*85)
-    print(f"{'Step':<6} | {'Starved Heads Count':<25} | {'Calibration Handoff Active?'}")
-    print("-" * 65)
     
     for step in range(1, STEPS_PER_DOMAIN + 1):
-        # 1. Dense Baseline Step
         opt_dense.zero_grad()
         out_dense = dense_baseline(data_tensor)
         loss_dense = F.mse_loss(out_dense, data_tensor)
         loss_dense.backward()
         opt_dense.step()
         
-        # 2. 16-Expert Sparse MoE Step
         optimizer.zero_grad()
         sig_weights = dsg(data_tensor)
         gate_logits = expert_proj(sig_weights)
@@ -93,37 +93,21 @@ for domain_name, data_tensor in domains.items():
         total_loss.backward()
         
         step_token_counts = active_mask.sum(dim=(0, 1))
-        starved_count = 0
-        calibration_fired = False
-        
         with torch.no_grad():
             for i, expert in enumerate(experts):
-                if step_token_counts[i].item() == 0:
-                    starved_count += 1
-                    if expert.w1.weight.grad is not None and expert.w1.weight.grad.norm().item() > 0:
-                        calibration_fired = True
-                        g_norm = expert.w1.weight.grad.norm().item()
-                        head_inactive_grads[i] += g_norm
-                else:
-                    if expert.w1.weight.grad is not None:
-                        g_norm = expert.w1.weight.grad.norm().item()
+                if expert.w1.weight.grad is not None:
+                    g_norm = expert.w1.weight.grad.norm().item()
+                    if step_token_counts[i].item() > 0:
                         head_active_grads[i] += g_norm
+                    else:
+                        head_inactive_grads[i] += g_norm
                         
         optimizer.step()
         
-        if step <= 5 or starved_count > 0:
-            cal_str = f"YES ({starved_count} heads starved)" if calibration_fired else "None"
-            print(f"Step {step:<2} | {starved_count} / {NUM_EXPERTS} experts starved        | {cal_str}")
-        elif step == 6:
-            print("... [Intermediate steps running with live calibration] ...")
-            
     mean_u = head_token_counts.mean().item()
     std_u = head_token_counts.std().item()
     cv = (std_u / mean_u) * 100 if mean_u > 0 else 0
     
-    print("\n" + "-"*85)
-    print(f"16-EXPERT SUMMARY FOR: {domain_name}")
-    print("-" * 85)
     print(f"  - Dense Baseline MSE Loss : {loss_dense.item():.6f}")
     print(f"  - ScaledUnGated MoE MSE   : {primary_loss.item():.6f}")
     print(f"  - MSE Loss Reduction     : {((loss_dense.item() - primary_loss.item()) / loss_dense.item()) * 100:+.2f}%")
