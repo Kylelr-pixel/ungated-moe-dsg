@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from my_code import ScaledUnGatedFunction, DomainSignatureGenerator, SwiGLUExpert
 
-# --- UN-HANDICAPPED PRODUCTION CONFIG ---
+# --- CLEAN PRODUCTION CONFIG: Z-Loss + SwiGLU + Per-Head Inspection ---
 BATCH_SIZE = 32
 SEQ_LEN = 128
 HIDDEN_DIM = 256
@@ -15,7 +15,7 @@ CAPACITY_FACTOR = 1.2
 STEPS_PER_DOMAIN = 150
 
 print("="*80)
-print("  BLIND HOLDOUT BENCHMARK: SwiGLU Experts + Full Per-Head Inspection")
+print("  BLIND HOLDOUT BENCHMARK: SwiGLU Experts + Z-Loss + Head Diagnostics")
 print("="*80)
 
 dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
@@ -60,7 +60,7 @@ for domain_name, data_tensor in domains.items():
         loss_dense.backward()
         opt_dense.step()
         
-        # 2. ScaledUnGated SwiGLU MoE Step
+        # 2. ScaledUnGated SwiGLU MoE Step with Z-Loss
         optimizer.zero_grad()
         sig_weights = dsg(data_tensor)
         gate_logits = expert_proj(sig_weights)
@@ -92,14 +92,16 @@ for domain_name, data_tensor in domains.items():
         out_moe = out_moe_raw.sum(dim=2)
         
         primary_loss = F.mse_loss(out_moe, data_tensor)
+        z_loss = torch.mean(torch.logsumexp(gate_logits, dim=-1)**2)
+        
         tokens_per_exp = active_mask.sum(dim=(0, 1)) / total_tokens_per_step
         router_prob_per_exp = gate_probs.mean(dim=(0, 1))
         aux_loss = NUM_EXPERTS * torch.sum(tokens_per_exp * router_prob_per_exp)
         
-        total_loss = primary_loss + 0.15 * aux_loss
+        total_loss = primary_loss + (0.001 * z_loss) + (0.15 * aux_loss)
         total_loss.backward()
         
-        # Track gradient magnitudes per expert
+        # Track gradient magnitudes cleanly
         with torch.no_grad():
             for i, expert in enumerate(experts):
                 if expert.w1.weight.grad is not None:
