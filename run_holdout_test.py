@@ -3,18 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from my_code import ScaledUnGatedFunction, DomainSignatureGenerator, SwiGLUExpert
 
-# --- UN-CAPPED PRODUCTION CONFIG: Testing Pure Backprop Calibration ---
+# --- SPARSE EXPLORATION CONFIG: Testing Top-K Sparsity & Calibration Handoffs ---
 BATCH_SIZE = 32
 SEQ_LEN = 128
 HIDDEN_DIM = 256
 INTERMEDIATE_DIM = 512
 SIGNATURE_DIM = 64
 NUM_EXPERTS = 8
-TOP_K = 2
+TOP_K = 2  # We can adjust this to 1 or 4 to test sparsity stress!
 STEPS_PER_DOMAIN = 150
 
 print("="*85)
-print("  BLIND HOLDOUT BENCHMARK: Drop-Free Routing + Backprop Calibration Test")
+print(f"  SPARSE ROUTING STRESS TEST: Top-{TOP_K} out of {NUM_EXPERTS} Experts + Calibration Handoff")
 print("="*85)
 
 dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
@@ -56,15 +56,14 @@ for domain_name, data_tensor in domains.items():
         loss_dense.backward()
         opt_dense.step()
         
-        # 2. Drop-Free ScaledUnGated MoE Step
+        # 2. Sparse ScaledUnGated MoE Step
         optimizer.zero_grad()
         sig_weights = dsg(data_tensor)
         gate_logits = expert_proj(sig_weights)
         gate_probs = F.softmax(gate_logits, dim=-1)
         
+        # Sparse Top-K Selection
         topk_probs, topk_indices = torch.topk(gate_probs, k=TOP_K, dim=-1)
-        
-        # DROP-FREE: 100% of selected tokens pass through to experts
         active_mask = torch.zeros_like(gate_probs)
         active_mask.scatter_(-1, topk_indices, 1.0)
                 
@@ -73,6 +72,7 @@ for domain_name, data_tensor in domains.items():
             
         expert_outputs = torch.stack([expert(data_tensor) for expert in experts], dim=2)
         
+        # Pass through ScaledUnGatedFunction (triggers calibration if mask is 0)
         out_moe_raw = ScaledUnGatedFunction.apply(
             expert_outputs, gate_probs.unsqueeze(-1), active_mask.unsqueeze(-1), 1.0
         )
@@ -88,7 +88,7 @@ for domain_name, data_tensor in domains.items():
         total_loss = primary_loss + (0.001 * z_loss) + (0.15 * aux_loss)
         total_loss.backward()
         
-        # Track gradient magnitudes cleanly
+        # Track active vs calibration gradients explicitly
         with torch.no_grad():
             for i, expert in enumerate(experts):
                 if expert.w1.weight.grad is not None:
@@ -105,12 +105,12 @@ for domain_name, data_tensor in domains.items():
     cv = (std_u / mean_u) * 100 if mean_u > 0 else 0
     
     print("\n" + "="*85)
-    print(f"RESULTS FOR: {domain_name}")
+    print(f"RESULTS FOR: {domain_name} (Top-{TOP_K} Sparse)")
     print("="*85)
     print(f"  - Dense Baseline MSE Loss : {loss_dense.item():.6f}")
     print(f"  - ScaledUnGated MoE MSE   : {primary_loss.item():.6f}")
     print(f"  - MSE Loss Reduction     : {((loss_dense.item() - primary_loss.item()) / loss_dense.item()) * 100:+.2f}%")
-    print(f"  - Router Load Balance CV : {cv:.2f}% (Dropped Tokens: 0 - DROP-FREE)")
+    print(f"  - Router Load Balance CV : {cv:.2f}% (Sparse Top-{TOP_K})")
     print("-" * 85)
     print(f"  PER-HEAD ACTIVITY & GRADIENT DISTRIBUTION OVER {STEPS_PER_DOMAIN} STEPS:")
     print(f"  {'Head ID':<8} | {'Tokens Routed':<16} | {'Avg Active Grad':<18} | {'Avg Inactive Grad':<18}")
