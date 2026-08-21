@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from my_code import ScaledUnGatedFunction, DomainSignatureGenerator, SwiGLUExpert
 
-# --- CLEAN PRODUCTION CONFIG: Z-Loss + SwiGLU + Per-Head Inspection ---
+# --- UN-CAPPED PRODUCTION CONFIG: Testing Pure Backprop Calibration ---
 BATCH_SIZE = 32
 SEQ_LEN = 128
 HIDDEN_DIM = 256
@@ -11,12 +11,11 @@ INTERMEDIATE_DIM = 512
 SIGNATURE_DIM = 64
 NUM_EXPERTS = 8
 TOP_K = 2
-CAPACITY_FACTOR = 1.2
 STEPS_PER_DOMAIN = 150
 
-print("="*80)
-print("  BLIND HOLDOUT BENCHMARK: SwiGLU Experts + Z-Loss + Head Diagnostics")
-print("="*80)
+print("="*85)
+print("  BLIND HOLDOUT BENCHMARK: Drop-Free Routing + Backprop Calibration Test")
+print("="*85)
 
 dsg = DomainSignatureGenerator(HIDDEN_DIM, SIGNATURE_DIM)
 expert_proj = nn.Linear(SIGNATURE_DIM, NUM_EXPERTS)
@@ -43,14 +42,11 @@ domains = {
 }
 
 total_tokens_per_step = BATCH_SIZE * SEQ_LEN * TOP_K
-fair_share = total_tokens_per_step / NUM_EXPERTS
-expert_capacity = int(fair_share * CAPACITY_FACTOR)
 
 for domain_name, data_tensor in domains.items():
     head_token_counts = torch.zeros(NUM_EXPERTS)
     head_active_grads = torch.zeros(NUM_EXPERTS)
     head_inactive_grads = torch.zeros(NUM_EXPERTS)
-    dropped_tokens = 0
     
     for step in range(1, STEPS_PER_DOMAIN + 1):
         # 1. Dense Baseline Step
@@ -60,26 +56,17 @@ for domain_name, data_tensor in domains.items():
         loss_dense.backward()
         opt_dense.step()
         
-        # 2. ScaledUnGated SwiGLU MoE Step with Z-Loss
+        # 2. Drop-Free ScaledUnGated MoE Step
         optimizer.zero_grad()
         sig_weights = dsg(data_tensor)
         gate_logits = expert_proj(sig_weights)
         gate_probs = F.softmax(gate_logits, dim=-1)
         
         topk_probs, topk_indices = torch.topk(gate_probs, k=TOP_K, dim=-1)
-        raw_mask = torch.zeros_like(gate_probs)
-        raw_mask.scatter_(-1, topk_indices, 1.0)
         
-        active_mask = torch.zeros_like(raw_mask)
-        for exp_idx in range(NUM_EXPERTS):
-            exp_mask = raw_mask[:, :, exp_idx]
-            selected_indices = torch.nonzero(exp_mask, as_tuple=False)
-            if selected_indices.size(0) > expert_capacity:
-                keep_indices = selected_indices[:expert_capacity]
-                active_mask[keep_indices[:, 0], keep_indices[:, 1], exp_idx] = 1.0
-                dropped_tokens += (selected_indices.size(0) - expert_capacity)
-            else:
-                active_mask[:, :, exp_idx] = exp_mask
+        # DROP-FREE: 100% of selected tokens pass through to experts
+        active_mask = torch.zeros_like(gate_probs)
+        active_mask.scatter_(-1, topk_indices, 1.0)
                 
         with torch.no_grad():
             head_token_counts += active_mask.sum(dim=(0, 1))
@@ -117,14 +104,14 @@ for domain_name, data_tensor in domains.items():
     std_u = head_token_counts.std().item()
     cv = (std_u / mean_u) * 100 if mean_u > 0 else 0
     
-    print("\n" + "="*80)
+    print("\n" + "="*85)
     print(f"RESULTS FOR: {domain_name}")
-    print("="*80)
+    print("="*85)
     print(f"  - Dense Baseline MSE Loss : {loss_dense.item():.6f}")
     print(f"  - ScaledUnGated MoE MSE   : {primary_loss.item():.6f}")
     print(f"  - MSE Loss Reduction     : {((loss_dense.item() - primary_loss.item()) / loss_dense.item()) * 100:+.2f}%")
-    print(f"  - Router Load Balance CV : {cv:.2f}% (Dropped Tokens: {dropped_tokens})")
-    print("-" * 80)
+    print(f"  - Router Load Balance CV : {cv:.2f}% (Dropped Tokens: 0 - DROP-FREE)")
+    print("-" * 85)
     print(f"  PER-HEAD ACTIVITY & GRADIENT DISTRIBUTION OVER {STEPS_PER_DOMAIN} STEPS:")
     print(f"  {'Head ID':<8} | {'Tokens Routed':<16} | {'Avg Active Grad':<18} | {'Avg Inactive Grad':<18}")
     print("  " + "-" * 75)
@@ -137,4 +124,4 @@ for domain_name, data_tensor in domains.items():
         inact_g = head_inactive_grads[i].item() / STEPS_PER_DOMAIN
         print(f"  Head {i:<3} | {cnt:<6} ({pct:5.1f}%) | {act_g:<18.6f} | {inact_g:<18.6f}")
 
-print("="*80)
+print("="*85)
